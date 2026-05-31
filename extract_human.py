@@ -1,48 +1,73 @@
 #!/usr/bin/env python3
-"""Extract clean human prose from Jekyll posts in ../argmin-gravitas/_posts.
+"""Extract clean human prose from Gavin's blog by scraping gleech.org/archive.
 
-Strips YAML frontmatter, Liquid tags/assigns, HTML tags, and quoted material
-(blockquotes and Markdown '>' quotes) so that what we feed Pangram is the
-author's own running prose rather than markup or other people's quotations.
+Fetches the archive index, follows each post link, and pulls the running prose
+out of the post body. Strips quoted material (blockquotes and their
+attributions), HTML markup, and the trailing comment/subscribe furniture so
+that what we feed Pangram is the author's own prose rather than markup or other
+people's quotations.
 """
 import json
 import os
 import re
-import glob
+import time
+import html as htmllib
+import urllib.request
+import urllib.error
 
-POSTS_DIR = os.path.expanduser("~/code/argmin-gravitas/_posts")
+BASE = "https://www.gleech.org"
+ARCHIVE_URL = BASE + "/archive"
 OUT = os.path.join(os.path.dirname(__file__), "human_samples.json")
+USER_AGENT = "pangranm-extract-human/1.0 (+https://gleech.org)"
+REQUEST_DELAY = 0.5  # seconds between requests, to be polite
+TIMEOUT = 30
+
 MIN_WORDS = 120      # skip thin posts
 TARGET_WORDS = 350   # trim each sample to roughly this for fair comparison
 MAX_SAMPLES = 100
 
 
-def strip_frontmatter(text):
-    if text.startswith("---"):
-        parts = text.split("---", 2)
-        if len(parts) >= 3:
-            return parts[2]
-    return text
+def fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
 
 
-def clean(text):
-    text = strip_frontmatter(text)
-    # Liquid tags/expressions {% ... %} and {{ ... }}
-    text = re.sub(r"\{%.*?%\}", " ", text, flags=re.DOTALL)
-    text = re.sub(r"\{\{.*?\}\}", " ", text, flags=re.DOTALL)
-    # HTML comments and tags
+def post_links(archive_html):
+    """Return ordered, de-duplicated list of post URLs from the archive."""
+    hrefs = re.findall(r'class=post-link href=([^\s>]+)', archive_html)
+    seen = set()
+    urls = []
+    for href in hrefs:
+        href = href.strip('"').strip("'")
+        url = href if href.startswith("http") else BASE + href
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def clean(post_html):
+    """Pull the author's running prose out of a post's HTML."""
+    m = re.search(r"<article class=post-content>(.*?)</article>",
+                  post_html, flags=re.DOTALL)
+    if not m:
+        return ""
+    text = m.group(1)
+    # Drop the trailing "Leave a comment" form and subscribe block.
+    text = re.split(r"<div class=accordion", text, maxsplit=1)[0]
+    # Remove quoted material (blockquotes + their attributions) and non-prose
+    # blocks entirely, contents and all.
+    for tag in ("blockquote", "center", "style", "script", "svg", "form",
+                "figure", "table"):
+        text = re.sub(rf"<{tag}\b.*?</{tag}>", " ", text,
+                      flags=re.DOTALL | re.IGNORECASE)
+    # HTML comments and remaining tags
     text = re.sub(r"<!--.*?-->", " ", text, flags=re.DOTALL)
     text = re.sub(r"<[^>]+>", " ", text)
-    # Drop Markdown blockquote lines (other people's words)
-    lines = [ln for ln in text.splitlines() if not ln.lstrip().startswith(">")]
-    text = "\n".join(lines)
-    # Markdown links [text](url) -> text ; images ![..](..) -> ''
-    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
-    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
-    # Headings / list markers / emphasis punctuation
-    text = re.sub(r"^[#>*\-\s]+", "", text, flags=re.MULTILINE)
-    text = text.replace("**", "").replace("__", "").replace("`", "")
-    # Footnote refs like [3]
+    # Decode entities (&amp; &rsquo; etc.)
+    text = htmllib.unescape(text)
+    # Footnote refs left behind as bare digits, e.g. "debate 3 ."
     text = re.sub(r"\[\d+\]", " ", text)
     # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
@@ -53,24 +78,31 @@ def trim_words(text, n):
     words = text.split()
     if len(words) <= n:
         return text
-    trimmed = " ".join(words[:n])
-    # cut back to last sentence end for cleanliness
-    m = re.search(r"^(.*[.!?])\s", trimmed[::-1])
-    return trimmed  # keep simple; trimming mid-sentence is fine for detection
+    return " ".join(words[:n])  # trimming mid-sentence is fine for detection
+
+
+def slug_of(url):
+    return url.rstrip("/").rsplit("/", 1)[-1] or url
 
 
 def main():
-    paths = sorted(glob.glob(os.path.join(POSTS_DIR, "*.md"))
-                   + glob.glob(os.path.join(POSTS_DIR, "*.markdown")))
+    archive_html = fetch(ARCHIVE_URL)
+    urls = post_links(archive_html)
+    print(f"Found {len(urls)} post links in archive")
     samples = []
-    for p in paths:
-        with open(p, encoding="utf-8", errors="ignore") as f:
-            raw = f.read()
-        body = clean(raw)
+    for url in urls:
+        try:
+            post_html = fetch(url)
+        except (urllib.error.URLError, urllib.error.HTTPError) as e:
+            print(f"  skip {url}: {e}")
+            continue
+        finally:
+            time.sleep(REQUEST_DELAY)
+        body = clean(post_html)
         if len(body.split()) < MIN_WORDS:
             continue
         samples.append({
-            "id": os.path.basename(p),
+            "id": slug_of(url),
             "label": "human",
             "text": trim_words(body, TARGET_WORDS),
         })
@@ -80,7 +112,8 @@ def main():
         json.dump(samples, f, indent=2, ensure_ascii=False)
     print(f"Wrote {len(samples)} human samples to {OUT}")
     wc = [len(s["text"].split()) for s in samples]
-    print(f"Word counts: min={min(wc)} max={max(wc)} mean={sum(wc)//len(wc)}")
+    if wc:
+        print(f"Word counts: min={min(wc)} max={max(wc)} mean={sum(wc)//len(wc)}")
 
 
 if __name__ == "__main__":
