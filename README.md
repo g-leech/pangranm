@@ -32,7 +32,7 @@ and 1.00 for AI samples. Run `python3 analyze.py` to reproduce the report.
 The scripts use only the Python standard library — no dependencies to install.
 
 **1. (Optional) Rebuild the human samples** from local Jekyll posts. This reads
-`~/code/argmin-gravitas/_posts`, strips frontmatter, Liquid tags, HTML, and
+`[~/code/argmin-gravitas/_posts](https://github.com/g-leech/argmin-gravitas/tree/master/_posts)`, strips frontmatter, Liquid tags, HTML, and
 quoted material, and trims each post to ~350 words:
 
 ```bash
